@@ -62,36 +62,13 @@ struct ContentView: View {
     }
 
     private var transcriptList: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(viewModel.segments) { segment in
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text(segment.timestamp, style: .time)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                Text(segment.language.rawValue.uppercased())
-                                    .font(.caption2.monospaced())
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text(segment.text)
-                                .font(.body)
-                                .textSelection(.enabled)
-                        }
-                        .id(segment.id)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-            }
-            .onChange(of: viewModel.segments.count) { _, _ in
-                if let last = viewModel.segments.last {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo(last.id, anchor: .bottom)
-                    }
-                }
-            }
-        }
+        SelectableTranscriptTextView(text: transcriptPlainText)
+    }
+
+    private var transcriptPlainText: String {
+        viewModel.segments
+            .map(\.text)
+            .joined(separator: "\n")
     }
 
     private var footer: some View {

@@ -11,6 +11,14 @@ actor WhisperTranscriber {
     private var localModelFolder: String?
     private var fallbackModelName: String
     private var didInitialize = false
+    private var decodeOptions = DecodingOptions(
+        temperature: 0.0,
+        usePrefillPrompt: true,
+        detectLanguage: true,
+        logProbThreshold: -0.5,
+        firstTokenLogProbThreshold: -1.0,
+        noSpeechThreshold: 0.8
+    )
 
     init(fallbackModelName: String = "large-v3-v20240930_626MB") {
         self.fallbackModelName = fallbackModelName
@@ -55,8 +63,10 @@ actor WhisperTranscriber {
         }
 
         statusHandler?(ModelPreparationStatus(message: "Downloading fallback model...", progress: 0.0))
+        let downloadBase = localModelFolder.map { URL(fileURLWithPath: $0, isDirectory: true) }
         let downloadedModelFolder = try await WhisperKit.download(
             variant: fallbackModelName,
+            downloadBase: downloadBase,
             progressCallback: { progress in
                 statusHandler?(ModelPreparationStatus(message: "Downloading fallback model...", progress: progress.fractionCompleted))
             }
@@ -76,7 +86,7 @@ actor WhisperTranscriber {
     func transcribe(audio: [Float]) async throws -> String {
         try await prepareIfNeeded()
         guard let whisperKit else { return "" }
-        let result = try await whisperKit.transcribe(audioArray: audio)
+        let result = try await whisperKit.transcribe(audioArray: audio, decodeOptions: decodeOptions)
         if let first = result.first {
             return first.text
         }

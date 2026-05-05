@@ -13,6 +13,7 @@ final class TranscriptionViewModel: ObservableObject {
     @Published var modelFolderPath: String = UserDefaults.standard.string(forKey: "ModelFolderPath") ?? ""
     @Published var modelPreparationMessage = "Model not prepared"
     @Published var modelDownloadProgress: Double?
+    @Published var transcriptIsSelectable = true
 
     private var session: TranscriptSession?
     private var audioBuffer: [Float] = []
@@ -160,10 +161,21 @@ final class TranscriptionViewModel: ObservableObject {
         let audioSlice = Array(audioBuffer.prefix(chunkSize))
         audioBuffer.removeFirst(min(chunkSize / 2, audioBuffer.count))
 
+        // Silence gate to suppress common "Thank you." hallucinations in quiet segments.
+        let rms = Self.rms(audioSlice)
+        if rms < 0.0035 {
+            statusMessage = "Silence detected..."
+            return
+        }
+
         do {
             let text = try await transcriber.transcribe(audio: audioSlice)
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
+            if Self.looksLikeHallucination(trimmed) {
+                statusMessage = "Filtered low-confidence phrase."
+                return
+            }
             appendFinalSegment(trimmed)
             statusMessage = "Transcribing..."
         } catch {
@@ -217,5 +229,26 @@ final class TranscriptionViewModel: ObservableObject {
         let m = (interval % 3600) / 60
         let s = interval % 60
         return String(format: "%02d:%02d:%02d", h, m, s)
+    }
+
+    private static func rms(_ samples: [Float]) -> Float {
+        guard !samples.isEmpty else { return 0 }
+        var sum: Float = 0
+        for v in samples { sum += v * v }
+        return sqrt(sum / Float(samples.count))
+    }
+
+    private static func looksLikeHallucination(_ text: String) -> Bool {
+        let normalized = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let blocked = [
+            "thank you.",
+            "thank you",
+            "thanks for watching",
+            "字幕由 amara.org 社群提供",
+            "字幕由amra.org社群提供"
+        ]
+        return blocked.contains(normalized)
     }
 }

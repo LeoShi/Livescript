@@ -1,137 +1,130 @@
-# Meeting Live Transcriptor Technical Design
+# Livescript Technical Design (Updated to Current Code)
 
-## Product Scope
-- Build a macOS app with a minimal floating window that always stays visible during meetings.
-- Ingest audio from both microphone and system output (Zoom, Google Meet, browser, etc.) in v1.
-- Run fully on-device transcription using WhisperKit with mandatory automatic language detection for zh/en/mixed speech (no manual language selector).
-- Show real-time partial + finalized transcript segments and support export to local files.
-- The floating window must be hidden from common screen sharing and screen capture paths (best-effort with macOS capture exclusion APIs).
-- Support continuous single-session transcription for meetings longer than 2 hours.
+## Product Scope (Implemented v1)
+- macOS floating live transcription window built with SwiftUI.
+- Capture from microphone, system audio, or both (`Mic`, `System`, `Mixed`).
+- Fully on-device ASR via WhisperKit with automatic language detection (`zh`, `en`, mixed).
+- Local transcript export (`.txt`, `.md`).
+- Best-effort stealth behavior for screen sharing/screen capture (`NSWindow.sharingType = .none`).
+- Long-session resilience using session checkpoints and append logs.
 
-## Architecture
+## Current Architecture
 ```mermaid
 flowchart LR
-    audioSources[AudioSourcesMicAndSystem] --> captureEngine[CaptureEngineAVAudioEngine]
-    captureEngine --> audioRouter[AudioRouterMixAndNormalize]
-    audioRouter --> asrPipeline[WhisperPipelineWhisperKit]
-    asrPipeline --> segmentStore[TranscriptStoreSegments]
-    segmentStore --> liveUI[FloatingWindowSwiftUI]
-    segmentStore --> exportService[ExportServiceTXTMDJSONSRT]
+    mic[Microphone AVAudioEngine] --> coordinator[AudioCaptureCoordinator]
+    sys[System Audio ScreenCaptureKit] --> coordinator
+    coordinator --> vm[TranscriptionViewModel]
+    vm --> whisper[WhisperTranscriber actor]
+    whisper --> vm
+    vm --> store[SessionStore actor]
+    vm --> ui[ContentView + SelectableTranscriptTextView]
+    vm --> export[TranscriptExporter]
 ```
 
-## Core Modules
-- **App Shell & Windowing**: custom floating panel (`NSPanel` + SwiftUI host) with translucency, rounded corners, compact controls (start/pause, source, export).
-- **Audio Capture Layer**:
-  - Mic input via `AVAudioEngine` input node.
-  - System audio capture via macOS system-audio path (ScreenCaptureKit or aggregate/virtual route abstraction, selected at runtime).
-  - Optional source mixer for `micOnly`, `systemOnly`, `micPlusSystem`.
-- **Streaming ASR Layer (WhisperKit)**:
-  - Frame/chunk buffering (e.g. 0.5-1.0s windows) and incremental decoding.
-  - Segment stabilization policy: partial text (gray) then finalized text (solid).
-  - Model profile presets: `quality` (larger multilingual model) vs `balanced` (smaller model).
-- **Language Controller**:
-  - Fixed `auto` mode only (no user choice).
-  - Detect `zh`, `en`, and mixed speech dynamically with confidence smoothing to reduce rapid language flip.
-  - Persist detected language tags per segment for later export and filtering.
-- **Stealth Window Controller**:
-  - Apply capture-exclusion flags (for example `NSWindow.sharingType = .none`) to keep window out of system capture streams when supported.
-  - Verify against screenshot APIs and ScreenCaptureKit-based recording/sharing paths.
-  - Fallback mode: one-click hide/show hotkey for edge cases where third-party tools ignore exclusion flags.
-- **Transcript Domain Store**:
-  - Session-based model (`TranscriptSession`, `TranscriptSegment` with start/end time, source, language, text, confidence).
-  - In-memory live store + periodic local checkpoint save for crash resilience.
-  - Long-session support with incremental disk append and bounded in-memory window.
-- **Export Layer**:
-  - File formats: `.txt` (plain), `.md` (timestamped), `.json` (structured), `.srt` (subtitle-style).
-  - Save panel with session naming and default output directory.
+## Module Design
 
-## UI/UX Design
-- Floating transcript card:
-  - Header: source selector, start/stop, settings.
-  - Body: auto-scrolling transcript feed, partial text style distinct from finalized text.
-  - Footer: session timer + export button.
-- Visual design principles:
-  - Minimal chrome, high contrast typography, adaptive dark/light mode, blur background.
-  - Non-intrusive width/height constraints and drag-to-move.
-- Accessibility:
-  - Adjustable font size, keyboard shortcuts, VoiceOver labels.
-- Privacy behavior:
-  - Always default to capture-exclusion enabled.
-  - Show an explicit "Hidden from capture: On/Best effort" status chip so user can trust behavior.
+### 1) App and UI
+- `LivescriptApp` injects a shared `TranscriptionViewModel`.
+- `ContentView` provides:
+  - source mode picker (`Mic`, `System`, `Mixed`)
+  - start/stop controls
+  - model folder management
+  - live status text, session timer, and export menu
+  - system capture state + quick-link to privacy settings when denied/error
+  - mic/system level meters for setup diagnostics
+- Transcript display uses `SelectableTranscriptTextView` (`NSTextView`) for reliable multi-line text selection.
+- Speaker labels are colorized and repeated labels are visually suppressed when the same speaker continues.
 
-## Audio Input Strategy for Meeting Apps
-- Treat Zoom/Google Meet/browser as generic system-audio producers, not app-specific integrations.
-- Provide source profiles:
-  - `Mic` for user speech.
-  - `System` for meeting playback.
-  - `Mixed` for both.
-- Permission flows:
-  - Microphone permission.
-  - Screen/system capture permission if using ScreenCaptureKit path.
-- Add audio health indicators (input level, clipping, silence) to guide setup.
+### 2) Audio Capture
+- `AudioCaptureCoordinator` handles independent per-source streams:
+  - mic via `AVAudioEngine` tap + conversion to mono 16 kHz float PCM
+  - system audio via `ScreenCaptureKit` (`SCStream`) audio output
+- Emits typed chunks:
+  - `CapturedAudioChunk(source: .mic/.system, samples: [Float])`
+- Emits explicit `SystemCaptureStatus`:
+  - `notStarted`, `starting`, `running`, `denied(message)`, `error(message)`
+- Permission hardening:
+  - uses `CGPreflightScreenCaptureAccess` / `CGRequestScreenCaptureAccess`
+  - surfaces detailed domain/code error context on failures
 
-## Performance and Reliability
-- Use backpressure-safe queues between capture and ASR.
-- Bound memory with rolling audio buffers and capped transcript history in UI.
-- Keep inference off main thread; UI updates on main actor only.
-- Recovery handling for model download/init failures, audio interruption, permission denial.
-- 2+ hour meeting support:
-  - Rotate audio/transcript chunks at fixed intervals (for example every 5 minutes) with atomic writes.
-  - Keep only recent context in RAM; reload older segments from local store on demand.
-  - Add periodic health checks (queue lag, decode latency, memory watermark) and auto-recovery if lag spikes.
+### 3) Transcription Pipeline
+- `TranscriptionViewModel` manages two independent rolling buffers (`micBuffer`, `systemBuffer`).
+- Chunk policy:
+  - fixed 3-second windows (48,000 samples @ 16 kHz)
+  - non-overlapping pop to reduce duplicate text
+- Performance policy:
+  - audio ingestion remains on main actor only for state updates
+  - Whisper decode runs in background tasks
+  - model calls are serialized by `WhisperTranscriber` actor
+- Quality policy:
+  - silence gate (RMS threshold)
+  - simple hallucination phrase filter
+  - mixed-mode echo bleed suppression: if mic energy tracks active system playback, suppress mic transcript line
 
-## Data Model (v1)
-- `TranscriptSession`: id, startTime, endTime, sourceMode, languageMode, modelProfile.
-- `TranscriptSegment`: id, sessionId, startSec, endSec, text, isFinal, languageCode, source, confidence.
-- `ExportRecord`: sessionId, format, fileURL, exportedAt.
-- `SessionChunk`: sessionId, chunkIndex, startedAt, endedAt, localAudioPath, localTranscriptPath, checksum.
+### 4) Whisper Model Handling
+- `WhisperTranscriber`:
+  - local-first model resolution from a selected base folder
+  - automatic fallback download when local model unavailable
+  - progress/status callback for UI
+- Current fallback variant in code: `large-v3-v20240930_626MB`
+- Decoding options tuned for low latency and stability:
+  - `temperature = 0.0`
+  - `detectLanguage = true`
+  - `withoutTimestamps = true`
+  - `wordTimestamps = false`
+  - `skipSpecialTokens = true`
+  - `suppressBlank = true`
+  - tuned `logProbThreshold`, `firstTokenLogProbThreshold`, `noSpeechThreshold`
 
-## Model Compatibility Decision
-- Evaluated local model path:
-  - `/Users/lei_shi/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo/snapshots/a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb`
-- Current files indicate an MLX model package (`library_name: mlx`, `weights.safetensors`) intended for `mlx-whisper` Python runtime.
-- WhisperKit in this app expects WhisperKit/CoreML-compatible model artifacts, so this MLX snapshot is not a direct drop-in for WhisperKit.
-- Plan:
-  - Use WhisperKit-supported model assets for in-app inference.
-  - Keep your MLX model as an optional future backend only if we add a separate MLX runtime bridge.
+### 5) Speaker Handling
+- `TranscriptSegment` includes optional `speakerLabel`.
+- In active mixed-mode UI behavior, speaker label is source-based:
+  - mic path => `You`
+  - system path => `System`
+- `SpeakerDiarizer` service exists and is wired/configurable, but current primary UI labels are source labels (not full person-level diarization in final rendering path).
 
-## Suggested File/Code Organization
-- `/Users/lei_shi/workspace/Livescript/Livescript/LivescriptApp.swift`: app entry, dependency bootstrap.
-- `/Users/lei_shi/workspace/Livescript/Livescript/ContentView.swift`: replace with floating transcript UI host.
-- New folders:
-  - `Livescript/UI/` (views + panel bridge)
-  - `Livescript/Audio/` (capture engine, source routing)
-  - `Livescript/Transcription/` (Whisper pipeline, language controller)
-  - `Livescript/Domain/` (session/segment models, store)
-  - `Livescript/Export/` (writers for txt/md/json/srt)
+### 6) Storage and Export
+- `SessionStore` persists checkpoint snapshots and append logs for long sessions and crash resilience.
+- Session folder is selected at start time (`custom_each_time` workflow).
+- `TranscriptExporter` currently supports:
+  - `.txt`
+  - `.md`
 
-## Implementation Phases
-- **Phase 1 - Vertical Slice**: floating window + mic-only live transcription + plain text export + auto language detect only.
-- **Phase 2 - System Audio and Stealth**: add system capture path, source mixer, and capture-exclusion behavior validation.
-- **Phase 3 - Mixed Language Quality**: tune mixed zh/en detection stability and segment confidence logic.
-- **Phase 4 - Long Session and Export Polish**: 2+ hour reliability hardening, chunk persistence, multi-format export, and onboarding UX.
+## Data Model (Current)
+- `TranscriptSession`
+  - `id`, `startedAt`, `endedAt`, `sourceMode`, `segments`
+- `TranscriptSegment`
+  - `id`, `timestamp`, `text`, `isFinal`, `language`, `speakerLabel`
 
-## Test Plan
-- Unit tests for segment merge/finalization logic and export format writers.
-- Integration tests for permission states and audio-source switching.
-- Manual acceptance scenarios:
-  - English-only call, Chinese-only call, mixed bilingual call.
-  - Zoom app audio, Google Meet in browser, local video playback.
-  - Long session (>=2 hours) for memory/performance stability.
-  - Screen share and recording validation: verify window is excluded in common capture tools; verify fallback quick-hide behavior.
+## Privacy and Permissions
+- Floating window uses capture exclusion as best effort.
+- Required runtime permissions:
+  - Microphone
+  - Screen & System Audio Recording (for `System` / `Mixed`)
+- UI explicitly surfaces capture status and errors to reduce silent failure states.
 
-## Key Risks and Mitigations
-- **System audio capture variability** across macOS versions/devices: add pluggable capture backends and clear setup diagnostics.
-- **Real-time latency** with large multilingual models: expose model profile toggle and chunk-size tuning.
-- **Language switching instability** in mixed speech: use hysteresis smoothing and confidence thresholds before switching dominant language labels.
-- **Permission friction**: first-run checklist with actionable error states.
-- **Capture exclusion not universal** across all third-party meeting tools: treat as best-effort, include live status and instant hide hotkey.
-- **Model format mismatch** (MLX vs WhisperKit/CoreML): standardize on WhisperKit model package for v1.
+## Performance and Reliability Notes
+- Latency improvements implemented:
+  - reduced chunk size to 3s
+  - moved decode work off main actor
+  - disabled timestamp decoding
+- Accuracy improvements implemented:
+  - stricter decode thresholds
+  - hallucination filtering
+  - speaker-echo suppression in mixed mode
+- Long session support:
+  - periodic checkpointing and append logs
+  - rolling buffers instead of unbounded raw audio growth
 
-## Definition of Done for v1
-- Floating live transcript window works while user is in meetings.
-- Mic + system audio capture both function on supported macOS.
-- zh/en/mixed transcription quality is acceptable with real-time updates and automatic language detection.
-- User can export transcript locally in at least `.txt` and `.md`.
-- Capture-exclusion behavior is enabled and validated on target screen sharing/capture workflows.
-- Single uninterrupted transcription session can run for 2+ hours without critical memory growth or transcript loss.
+## Known Limitations (Current Code)
+- No partial-token UI; transcript shows finalized chunk-level text.
+- Speaker identity in UI is source-level (`You`/`System`) rather than full multi-person diarization.
+- Export formats limited to `.txt` and `.md`.
+- Capture exclusion remains best-effort across third-party sharing tools.
+
+## Next Technical Steps
+1. Add optional model profile/runtime picker (speed vs quality variants).
+2. Add optional word timestamps and timeline UI mode.
+3. Integrate diarization output into final displayed labels when confidence is stable.
+4. Add additional export formats (`.json`, `.srt`) and speaker-aware formatting options.
+5. Add automated tests for mixed-mode gating and segment de-dup behavior.

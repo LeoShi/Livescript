@@ -1,7 +1,26 @@
 import AVFoundation
+import CoreGraphics
 import Foundation
 import ScreenCaptureKit
 import CoreMedia
+
+enum CapturedAudioSource: String {
+    case mic
+    case system
+}
+
+struct CapturedAudioChunk {
+    let source: CapturedAudioSource
+    let samples: [Float]
+}
+
+enum SystemCaptureStatus: Equatable {
+    case notStarted
+    case starting
+    case running
+    case denied(String)
+    case error(String)
+}
 
 enum AudioCaptureError: LocalizedError {
     case inputUnavailable
@@ -21,13 +40,10 @@ final class AudioCaptureCoordinator {
     private let micEngine = AVAudioEngine()
     private var micConverter: AVAudioConverter?
     private var systemCapture: SystemAudioCapture?
-    private let queue = DispatchQueue(label: "AudioCaptureCoordinator.queue")
-
-    private var latestMicChunk: [Float] = []
-    private var latestSystemChunk: [Float] = []
     private var sourceMode: TranscriptSourceMode = .mic
 
-    var onPCMChunk: (([Float]) -> Void)?
+    var onChunk: ((CapturedAudioChunk) -> Void)?
+    var onSystemStatus: ((SystemCaptureStatus) -> Void)?
 
     func start(sourceMode: TranscriptSourceMode) throws {
         self.sourceMode = sourceMode
@@ -36,6 +52,8 @@ final class AudioCaptureCoordinator {
         }
         if sourceMode == .system || sourceMode == .mixed {
             startSystemAudio()
+        } else {
+            onSystemStatus?(.notStarted)
         }
     }
 
@@ -44,6 +62,7 @@ final class AudioCaptureCoordinator {
         micEngine.stop()
         systemCapture?.stop()
         systemCapture = nil
+        onSystemStatus?(.notStarted)
     }
 
     private func startMicrophone() throws {
@@ -60,7 +79,7 @@ final class AudioCaptureCoordinator {
         input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
             guard let mono = self.convertToMono16K(buffer: buffer, converter: converter, targetFormat: targetFormat) else { return }
-            self.handleIncomingChunk(mono, kind: .mic)
+            self.onChunk?(CapturedAudioChunk(source: .mic, samples: mono))
         }
 
         micEngine.prepare()
@@ -68,45 +87,17 @@ final class AudioCaptureCoordinator {
     }
 
     private func startSystemAudio() {
-        let capture = SystemAudioCapture { [weak self] chunk in
-            self?.handleIncomingChunk(chunk, kind: .system)
-        }
+        onSystemStatus?(.starting)
+        let capture = SystemAudioCapture(
+            onChunk: { [weak self] chunk in
+                self?.onChunk?(CapturedAudioChunk(source: .system, samples: chunk))
+            },
+            onStatus: { [weak self] status in
+                self?.onSystemStatus?(status)
+            }
+        )
         self.systemCapture = capture
         capture.start()
-    }
-
-    private func handleIncomingChunk(_ chunk: [Float], kind: InputKind) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            switch kind {
-            case .mic:
-                self.latestMicChunk = chunk
-            case .system:
-                self.latestSystemChunk = chunk
-            }
-
-            let output: [Float]
-            switch self.sourceMode {
-            case .mic:
-                output = self.latestMicChunk
-            case .system:
-                output = self.latestSystemChunk
-            case .mixed:
-                output = Self.mix(self.latestMicChunk, self.latestSystemChunk)
-            }
-            guard !output.isEmpty else { return }
-            self.onPCMChunk?(output)
-        }
-    }
-
-    private static func mix(_ a: [Float], _ b: [Float]) -> [Float] {
-        let count = min(a.count, b.count)
-        guard count > 0 else { return a.isEmpty ? b : a }
-        var mixed = [Float](repeating: 0, count: count)
-        for i in 0..<count {
-            mixed[i] = (a[i] + b[i]) * 0.5
-        }
-        return mixed
     }
 
     private static func makeTargetFormat() throws -> AVAudioFormat {
@@ -139,28 +130,35 @@ final class AudioCaptureCoordinator {
         let count = Int(output.frameLength)
         return Array(UnsafeBufferPointer(start: channelData, count: count))
     }
-
-    private enum InputKind {
-        case mic
-        case system
-    }
 }
 
 private final class SystemAudioCapture: NSObject {
     private var stream: SCStream?
     private let output = SystemAudioOutput()
     private let queue = DispatchQueue(label: "SystemAudioCapture.stream")
+    private let onStatus: (SystemCaptureStatus) -> Void
 
-    init(onChunk: @escaping ([Float]) -> Void) {
+    init(onChunk: @escaping ([Float]) -> Void, onStatus: @escaping (SystemCaptureStatus) -> Void) {
+        self.onStatus = onStatus
         super.init()
         output.onChunk = onChunk
     }
 
     func start() {
+        // Force-trigger the OS Screen Recording prompt if needed. After a Debug rebuild
+        // the binary's code signature changes and the cached TCC entry can become stale —
+        // CGRequestScreenCaptureAccess re-syncs it. The call is a no-op when already granted.
+        if !CGPreflightScreenCaptureAccess() {
+            _ = CGRequestScreenCaptureAccess()
+        }
+
         Task {
             do {
-                let content = try await SCShareableContent.current
-                guard let display = content.displays.first else { return }
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                guard let display = content.displays.first else {
+                    self.onStatus(.error("No displays available for capture"))
+                    return
+                }
 
                 let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
                 let config = SCStreamConfiguration()
@@ -169,14 +167,26 @@ private final class SystemAudioCapture: NSObject {
                 config.sampleRate = 16_000
                 config.channelCount = 1
                 config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+                config.width = 2
+                config.height = 2
 
                 let stream = SCStream(filter: filter, configuration: config, delegate: nil)
                 self.stream = stream
 
                 try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: queue)
                 try await stream.startCapture()
+                self.onStatus(.running)
             } catch {
-                // Permission denied or capture unsupported: keep silent, caller handles no-data state.
+                let nsError = error as NSError
+                let isDenied = (nsError.code == -3801) ||
+                    nsError.domain.contains("SCStreamError") && nsError.code == -3801 ||
+                    nsError.domain == "com.apple.coremedia.tcc"
+                let detail = "[\(nsError.domain) \(nsError.code)] \(nsError.localizedDescription)"
+                if isDenied {
+                    self.onStatus(.denied("Permission stale. Open System Settings > Privacy & Security > Screen & System Audio Recording, toggle Livescript OFF then ON, fully quit and relaunch the app. \(detail)"))
+                } else {
+                    self.onStatus(.error(detail))
+                }
             }
         }
     }

@@ -15,6 +15,10 @@ actor WhisperTranscriber {
         temperature: 0.0,
         usePrefillPrompt: true,
         detectLanguage: true,
+        skipSpecialTokens: true,
+        withoutTimestamps: true,
+        wordTimestamps: false,
+        suppressBlank: true,
         logProbThreshold: -0.5,
         firstTokenLogProbThreshold: -1.0,
         noSpeechThreshold: 0.8
@@ -44,11 +48,11 @@ actor WhisperTranscriber {
     func prepareIfNeeded(statusHandler: ((ModelPreparationStatus) -> Void)? = nil) async throws {
         if didInitialize, whisperKit != nil { return }
 
-        if let localModelFolder {
+        if let localModelFolder, let resolvedLocalFolder = resolveLocalWhisperFolder(from: localModelFolder) {
             do {
-                statusHandler?(ModelPreparationStatus(message: "Loading local model...", progress: nil))
+                statusHandler?(ModelPreparationStatus(message: "Loading local model (\(resolvedLocalFolder))...", progress: nil))
                 let localConfig = WhisperKitConfig(
-                    modelFolder: localModelFolder,
+                    modelFolder: resolvedLocalFolder,
                     verbose: false,
                     load: true,
                     download: false
@@ -60,6 +64,8 @@ actor WhisperTranscriber {
             } catch {
                 statusHandler?(ModelPreparationStatus(message: "Local model failed, downloading fallback...", progress: 0.0))
             }
+        } else if localModelFolder != nil {
+            statusHandler?(ModelPreparationStatus(message: "No local Whisper model found, downloading fallback...", progress: 0.0))
         }
 
         statusHandler?(ModelPreparationStatus(message: "Downloading fallback model...", progress: 0.0))
@@ -91,5 +97,48 @@ actor WhisperTranscriber {
             return first.text
         }
         return ""
+    }
+
+    private func resolveLocalWhisperFolder(from selectedPath: String) -> String? {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: selectedPath, isDirectory: &isDir), isDir.boolValue else { return nil }
+
+        // 1) Direct model folder selection
+        if containsWhisperModelFiles(at: selectedPath) {
+            return selectedPath
+        }
+
+        // 2) Repository roots under selected base
+        let repoCandidates = [
+            "\(selectedPath)/argmaxinc/whisperkit-coreml",
+            "\(selectedPath)/models/argmaxinc/whisperkit-coreml",
+            "\(selectedPath)/huggingface_models/argmaxinc/whisperkit-coreml"
+        ]
+
+        let variantCandidates = [
+            "openai_whisper-\(fallbackModelName)",
+            fallbackModelName
+        ]
+
+        for repo in repoCandidates where fm.fileExists(atPath: repo, isDirectory: &isDir) && isDir.boolValue {
+            for variant in variantCandidates {
+                let modelPath = "\(repo)/\(variant)"
+                if containsWhisperModelFiles(at: modelPath) {
+                    return modelPath
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private func containsWhisperModelFiles(at path: String) -> Bool {
+        let fm = FileManager.default
+        let requiredPrefixes = ["MelSpectrogram", "AudioEncoder", "TextDecoder"]
+        guard let items = try? fm.contentsOfDirectory(atPath: path) else { return false }
+        return requiredPrefixes.allSatisfy { prefix in
+            items.contains(where: { $0.hasPrefix(prefix) })
+        }
     }
 }

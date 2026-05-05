@@ -19,6 +19,7 @@ struct TranscriptSegment: Identifiable, Codable {
     var text: String
     var isFinal: Bool
     var language: TranscriptLanguage
+    var speakerLabel: String?
 }
 
 struct TranscriptSession: Codable {

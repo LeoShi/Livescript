@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		0957AA3E2FA9D00300C7CC73 /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = 0957AA3D2FA9D00300C7CC73 /* WhisperKit */; };
+		0957AA402FA9D00300C7CC73 /* SpeakerKit in Frameworks */ = {isa = PBXBuildFile; productRef = 0957AA412FA9D00300C7CC73 /* SpeakerKit */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -27,6 +28,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				0957AA402FA9D00300C7CC73 /* SpeakerKit in Frameworks */,
 				0957AA3E2FA9D00300C7CC73 /* WhisperKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -70,6 +72,7 @@
 			);
 			name = Livescript;
 			packageProductDependencies = (
+				0957AA412FA9D00300C7CC73 /* SpeakerKit */,
 				0957AA3D2FA9D00300C7CC73 /* WhisperKit */,
 			);
 			productName = Livescript;
@@ -389,6 +392,11 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		0957AA412FA9D00300C7CC73 /* SpeakerKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 0957AA3C2FA9D00300C7CC73 /* XCRemoteSwiftPackageReference "argmax-oss-swift" */;
+			productName = SpeakerKit;
+		};
 		0957AA3D2FA9D00300C7CC73 /* WhisperKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 0957AA3C2FA9D00300C7CC73 /* XCRemoteSwiftPackageReference "argmax-oss-swift" */;

@@ -21,14 +21,20 @@ enum TranscriptExporter {
         case .txt:
             return session.segments
                 .filter { $0.isFinal }
-                .map(\.text)
+                .map { segment in
+                    if let speaker = segment.speakerLabel, !speaker.isEmpty {
+                        return "\(speaker): \(segment.text)"
+                    }
+                    return segment.text
+                }
                 .joined(separator: "\n")
         case .md:
             let header = "# Transcript\n\n- Session ID: \(session.id.uuidString)\n- Started: \(session.startedAt)\n\n"
             let body = session.segments
                 .filter { $0.isFinal }
                 .map { segment in
-                    "[\(timeString(segment.timestamp))] (\(segment.language.rawValue)) \(segment.text)"
+                    let speakerPrefix = (segment.speakerLabel?.isEmpty == false) ? "\(segment.speakerLabel!): " : ""
+                    return "[\(timeString(segment.timestamp))] (\(segment.language.rawValue)) \(speakerPrefix)\(segment.text)"
                 }
                 .joined(separator: "\n")
             return header + body + "\n"

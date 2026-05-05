@@ -8,22 +8,35 @@ final class TranscriptionViewModel: ObservableObject {
     @Published var isRunning = false
     @Published var captureHiddenStatus = "Hidden from capture: best effort"
     @Published var statusMessage = "Idle"
+    @Published var systemCaptureStatus = "System audio: idle"
     @Published var segments: [TranscriptSegment] = []
     @Published var elapsedText = "00:00:00"
     @Published var modelFolderPath: String = UserDefaults.standard.string(forKey: "ModelFolderPath") ?? ""
     @Published var modelPreparationMessage = "Model not prepared"
     @Published var modelDownloadProgress: Double?
     @Published var transcriptIsSelectable = true
+    @Published var micLevel: Float = 0
+    @Published var systemLevel: Float = 0
 
     private var session: TranscriptSession?
-    private var audioBuffer: [Float] = []
+    private var micBuffer: [Float] = []
+    private var systemBuffer: [Float] = []
     private var startedAt: Date?
     private var timer: Timer?
     private var lastChunkSaveAt: Date = .distantPast
+    private var lastSystemChunkAt: Date = .distantPast
+    /// Exponential moving average of recent system audio energy. Used as an echo-bleed
+    /// reference so we don't transcribe YouTube playing through speakers as the user.
+    private var recentSystemEnergy: Float = 0
 
     private let capture = AudioCaptureCoordinator()
     private let transcriber = WhisperTranscriber(fallbackModelName: "large-v3-v20240930_626MB")
+    private let speakerDiarizer = SpeakerDiarizer()
     private var store: SessionStore?
+
+    /// 3 seconds at 16 kHz. Smaller windows trade a small amount of accuracy
+    /// (less context per pass) for noticeably lower visible latency.
+    private static let transcriptionChunkSize = 48_000
 
     func start() async {
         guard !isRunning else { return }
@@ -44,6 +57,9 @@ final class TranscriptionViewModel: ObservableObject {
         await transcriber.configure(
             localModelFolder: modelFolderPath.trimmingCharacters(in: .whitespacesAndNewlines),
             fallbackModelName: "large-v3-v20240930_626MB"
+        )
+        await speakerDiarizer.configure(
+            downloadBaseFolder: modelFolderPath.trimmingCharacters(in: .whitespacesAndNewlines)
         )
         do {
             try await transcriber.prepareIfNeeded { status in
@@ -71,12 +87,23 @@ final class TranscriptionViewModel: ObservableObject {
         statusMessage = "Starting..."
         modelDownloadProgress = nil
         segments = []
-        audioBuffer = []
+        micBuffer = []
+        systemBuffer = []
         lastChunkSaveAt = .distantPast
+        lastSystemChunkAt = .distantPast
+        recentSystemEnergy = 0
+        micLevel = 0
+        systemLevel = 0
+        systemCaptureStatus = sourceMode == .mic ? "System audio: not used" : "System audio: starting…"
 
-        capture.onPCMChunk = { [weak self] chunk in
+        capture.onChunk = { [weak self] chunk in
             Task { @MainActor in
-                await self?.consumeAudio(chunk)
+                self?.consume(chunk)
+            }
+        }
+        capture.onSystemStatus = { [weak self] status in
+            Task { @MainActor in
+                self?.applySystemStatus(status)
             }
         }
 
@@ -120,6 +147,9 @@ final class TranscriptionViewModel: ObservableObject {
         stopTimer()
         isRunning = false
         statusMessage = "Stopped."
+        systemCaptureStatus = "System audio: idle"
+        micLevel = 0
+        systemLevel = 0
 
         if var session {
             session.endedAt = Date()
@@ -151,47 +181,101 @@ final class TranscriptionViewModel: ObservableObject {
         }
     }
 
-    private func consumeAudio(_ chunk: [Float]) async {
-        guard isRunning else { return }
-        audioBuffer.append(contentsOf: chunk)
-
-        // Process roughly every 5 seconds at 16kHz.
-        let chunkSize = 80_000
-        guard audioBuffer.count >= chunkSize else { return }
-        let audioSlice = Array(audioBuffer.prefix(chunkSize))
-        audioBuffer.removeFirst(min(chunkSize / 2, audioBuffer.count))
-
-        // Silence gate to suppress common "Thank you." hallucinations in quiet segments.
-        let rms = Self.rms(audioSlice)
-        if rms < 0.0035 {
-            statusMessage = "Silence detected..."
-            return
-        }
-
-        do {
-            let text = try await transcriber.transcribe(audio: audioSlice)
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return }
-            if Self.looksLikeHallucination(trimmed) {
-                statusMessage = "Filtered low-confidence phrase."
-                return
-            }
-            appendFinalSegment(trimmed)
-            statusMessage = "Transcribing..."
-        } catch {
-            statusMessage = "Transcription error: \(error.localizedDescription)"
+    private func applySystemStatus(_ status: SystemCaptureStatus) {
+        switch status {
+        case .notStarted:
+            systemCaptureStatus = sourceMode == .mic ? "System audio: not used" : "System audio: idle"
+        case .starting:
+            systemCaptureStatus = "System audio: starting…"
+        case .running:
+            systemCaptureStatus = "System audio: running"
+        case .denied(let message):
+            systemCaptureStatus = "System audio: denied — \(message)"
+        case .error(let message):
+            systemCaptureStatus = "System audio: error — \(message)"
         }
     }
 
-    private func appendFinalSegment(_ text: String) {
+    private func consume(_ chunk: CapturedAudioChunk) {
+        guard isRunning else { return }
+        switch chunk.source {
+        case .mic:
+            let energy = Self.rms(chunk.samples)
+            micLevel = energy
+            guard sourceMode == .mic || sourceMode == .mixed else { return }
+            micBuffer.append(contentsOf: chunk.samples)
+            if let slice = popAudioSlice(from: &micBuffer, chunkSize: Self.transcriptionChunkSize) {
+                scheduleTranscription(slice: slice, speakerLabel: "You")
+            }
+        case .system:
+            let energy = Self.rms(chunk.samples)
+            systemLevel = energy
+            // EMA so the mic-bleed gate has a stable reference even between SCK callbacks.
+            recentSystemEnergy = max(energy, recentSystemEnergy * 0.85)
+            lastSystemChunkAt = Date()
+            guard sourceMode == .system || sourceMode == .mixed else { return }
+            systemBuffer.append(contentsOf: chunk.samples)
+            if let slice = popAudioSlice(from: &systemBuffer, chunkSize: Self.transcriptionChunkSize) {
+                scheduleTranscription(slice: slice, speakerLabel: "System")
+            }
+        }
+    }
+
+    /// Pops a fixed-size, non-overlapping window from the front of the buffer.
+    private func popAudioSlice(from buffer: inout [Float], chunkSize: Int) -> [Float]? {
+        guard buffer.count >= chunkSize else { return nil }
+        let audioSlice = Array(buffer.prefix(chunkSize))
+        buffer.removeFirst(chunkSize)
+        return audioSlice
+    }
+
+    /// Fire-and-forget transcription. Runs Whisper off the main actor so capture callbacks
+    /// keep flowing and the UI stays responsive while the model decodes.
+    private func scheduleTranscription(slice: [Float], speakerLabel: String) {
+        let energy = Self.rms(slice)
+        if energy < 0.0035 { return }
+
+        // Echo / mic-bleed gate: in mixed mode, when the system is actively playing
+        // and the mic is quieter than the system, the mic is almost certainly picking up
+        // speaker bleed rather than a person talking. Drop those slices.
+        if speakerLabel == "You", sourceMode == .mixed {
+            let systemRef = max(recentSystemEnergy, systemLevel)
+            if systemRef > 0.004, energy < systemRef * 1.6 {
+                statusMessage = "Filtered echo bleed from speakers."
+                return
+            }
+        }
+
+        let transcriber = self.transcriber
+        Task {
+            do {
+                let text = try await transcriber.transcribe(audio: slice)
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
+                if Self.looksLikeHallucination(trimmed) { return }
+                await MainActor.run {
+                    self.appendFinalSegment(trimmed, speakerLabel: speakerLabel)
+                    self.statusMessage = "Transcribing \(speakerLabel)…"
+                }
+            } catch {
+                await MainActor.run {
+                    self.statusMessage = "Transcription error: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func appendFinalSegment(_ text: String, speakerLabel: String?) {
         guard var session else { return }
         let language = LanguageDetector.detect(from: text)
+        let normalizedSpeaker = speakerLabel ?? "Speaker ?"
         let segment = TranscriptSegment(
             id: UUID(),
             timestamp: Date(),
             text: text,
             isFinal: true,
-            language: language
+            language: language,
+            speakerLabel: normalizedSpeaker
         )
 
         segments.append(segment)

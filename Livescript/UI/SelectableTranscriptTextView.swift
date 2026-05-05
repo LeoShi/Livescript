@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 struct SelectableTranscriptTextView: NSViewRepresentable {
-    let text: String
+    let attributedText: NSAttributedString
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
@@ -21,7 +21,7 @@ struct SelectableTranscriptTextView: NSViewRepresentable {
         textView.textContainer?.lineFragmentPadding = 0
         textView.textContainer?.widthTracksTextView = true
         textView.font = .preferredFont(forTextStyle: .body)
-        textView.string = text
+        textView.textStorage?.setAttributedString(attributedText)
 
         scrollView.documentView = textView
         return scrollView
@@ -29,8 +29,8 @@ struct SelectableTranscriptTextView: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         guard let textView = nsView.documentView as? NSTextView else { return }
-        if textView.string != text {
-            textView.string = text
+        if textView.attributedString() != attributedText {
+            textView.textStorage?.setAttributedString(attributedText)
             textView.scrollToEndOfDocument(nil)
         }
     }

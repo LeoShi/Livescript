@@ -9,9 +9,12 @@ import SwiftUI
 
 @main
 struct LivescriptApp: App {
+    @StateObject private var viewModel = TranscriptionViewModel()
+
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(viewModel)
         }
     }
 }

@@ -2,6 +2,8 @@ import AppKit
 import SwiftUI
 
 struct FloatingWindowConfigurator: NSViewRepresentable {
+    var isStealthEnabled: Bool
+
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         DispatchQueue.main.async {
@@ -24,7 +26,7 @@ struct FloatingWindowConfigurator: NSViewRepresentable {
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
-        window.sharingType = .none
+        window.sharingType = isStealthEnabled ? .none : .readOnly
         window.backgroundColor = .clear
         window.isOpaque = false
     }

@@ -22,7 +22,10 @@ struct ContentView: View {
         .padding(14)
         .frame(minWidth: 520, minHeight: 340)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
-        .overlay(FloatingWindowConfigurator().allowsHitTesting(false))
+        .overlay(
+            FloatingWindowConfigurator(isStealthEnabled: viewModel.isStealthEnabled)
+                .allowsHitTesting(false)
+        )
     }
 
     private var header: some View {
@@ -47,9 +50,12 @@ struct ContentView: View {
 
             Spacer()
 
-            Text(viewModel.captureHiddenStatus)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Toggle(isOn: $viewModel.isStealthEnabled) {
+                Text("Stealth")
+                    .font(.caption)
+            }
+            .toggleStyle(.checkbox)
+            .help("When enabled, the window is hidden from screen sharing and capture.")
 
             Menu("Model") {
                 Button("Choose Local Model Folder") { viewModel.chooseModelFolder() }

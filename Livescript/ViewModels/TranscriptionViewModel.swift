@@ -6,7 +6,16 @@ import Foundation
 final class TranscriptionViewModel: ObservableObject {
     @Published var sourceMode: TranscriptSourceMode = .mixed
     @Published var isRunning = false
-    @Published var captureHiddenStatus = "Hidden from capture: best effort"
+    @Published var isStealthEnabled: Bool = {
+        if UserDefaults.standard.object(forKey: "StealthEnabled") == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: "StealthEnabled")
+    }() {
+        didSet {
+            UserDefaults.standard.set(isStealthEnabled, forKey: "StealthEnabled")
+        }
+    }
     @Published var statusMessage = "Idle"
     @Published var systemCaptureStatus = "System audio: idle"
     @Published var segments: [TranscriptSegment] = []

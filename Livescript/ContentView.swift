@@ -36,6 +36,15 @@ struct ContentView: View {
             .frame(maxWidth: 240)
             .disabled(viewModel.isRunning)
 
+            Picker("Speed", selection: $viewModel.speedProfile) {
+                ForEach(TranscriptionSpeedProfile.allCases) { profile in
+                    Text(profile.displayName).tag(profile)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 260)
+            .disabled(viewModel.isRunning)
+
             Spacer()
 
             Text(viewModel.captureHiddenStatus)
@@ -64,6 +73,7 @@ struct ContentView: View {
 
     private var transcriptList: some View {
         SelectableTranscriptTextView(attributedText: transcriptAttributedText)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var transcriptAttributedText: NSAttributedString {
@@ -87,12 +97,14 @@ struct ContentView: View {
                 full.append(label)
             }
 
+            let contentAttributes: [NSAttributedString.Key: Any] = [
+                .font: baseFont,
+                .foregroundColor: bodyColor
+            ]
+
             let content = NSAttributedString(
                 string: text + "\n",
-                attributes: [
-                    .font: baseFont,
-                    .foregroundColor: bodyColor
-                ]
+                attributes: contentAttributes
             )
             full.append(content)
             previousSpeaker = speaker.isEmpty ? previousSpeaker : speaker

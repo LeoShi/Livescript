@@ -20,7 +20,7 @@ enum TranscriptExporter {
         switch format {
         case .txt:
             return session.segments
-                .filter { $0.isFinal }
+                .filter { $0.isFinal && $0.phase == .refined }
                 .map { segment in
                     if let speaker = segment.speakerLabel, !speaker.isEmpty {
                         return "\(speaker): \(segment.text)"
@@ -31,7 +31,7 @@ enum TranscriptExporter {
         case .md:
             let header = "# Transcript\n\n- Session ID: \(session.id.uuidString)\n- Started: \(session.startedAt)\n\n"
             let body = session.segments
-                .filter { $0.isFinal }
+                .filter { $0.isFinal && $0.phase == .refined }
                 .map { segment in
                     let speakerPrefix = (segment.speakerLabel?.isEmpty == false) ? "\(segment.speakerLabel!): " : ""
                     return "[\(timeString(segment.timestamp))] (\(segment.language.rawValue)) \(speakerPrefix)\(segment.text)"

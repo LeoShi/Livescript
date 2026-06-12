@@ -1,8 +1,9 @@
 import AVFoundation
+import CoreAudio
 import CoreGraphics
+import CoreMedia
 import Foundation
 import ScreenCaptureKit
-import CoreMedia
 
 enum CapturedAudioSource: String {
     case mic
@@ -25,6 +26,7 @@ enum SystemCaptureStatus: Equatable {
 enum AudioCaptureError: LocalizedError {
     case inputUnavailable
     case conversionFailed
+    case microphonePermissionDenied
 
     var errorDescription: String? {
         switch self {
@@ -32,22 +34,38 @@ enum AudioCaptureError: LocalizedError {
             return "Audio input is unavailable."
         case .conversionFailed:
             return "Failed to convert captured audio."
+        case .microphonePermissionDenied:
+            return "Microphone permission is required."
         }
     }
 }
 
 final class AudioCaptureCoordinator {
-    private let micEngine = AVAudioEngine()
+    private var micEngine = AVAudioEngine()
     private var micConverter: AVAudioConverter?
+    private var micTargetFormat: AVAudioFormat?
+    private var micConfigObserver: NSObjectProtocol?
+    private var defaultInputDeviceListener: AudioObjectPropertyListenerBlock?
     private var systemCapture: SystemAudioCapture?
     private var sourceMode: TranscriptSourceMode = .mic
+    private var isMicRunning = false
+
+    private(set) var microphoneInputKind: AudioInputKind = .unknown
 
     var onChunk: ((CapturedAudioChunk) -> Void)?
     var onSystemStatus: ((SystemCaptureStatus) -> Void)?
 
+    deinit {
+        if let micConfigObserver {
+            NotificationCenter.default.removeObserver(micConfigObserver)
+        }
+        removeDefaultInputDeviceListener()
+    }
+
     func start(sourceMode: TranscriptSourceMode) throws {
         self.sourceMode = sourceMode
         if sourceMode == .mic || sourceMode == .mixed {
+            try ensureMicrophonePermission()
             try startMicrophone()
         }
         if sourceMode == .system || sourceMode == .mixed {
@@ -58,32 +76,147 @@ final class AudioCaptureCoordinator {
     }
 
     func stop() {
-        micEngine.inputNode.removeTap(onBus: 0)
-        micEngine.stop()
+        if let micConfigObserver {
+            NotificationCenter.default.removeObserver(micConfigObserver)
+            self.micConfigObserver = nil
+        }
+        removeDefaultInputDeviceListener()
+        tearDownMicrophoneEngine()
         systemCapture?.stop()
         systemCapture = nil
         onSystemStatus?(.notStarted)
     }
 
+    private func ensureMicrophonePermission() throws {
+        if #available(macOS 14.0, *) {
+            switch AVAudioApplication.shared.recordPermission {
+            case .granted:
+                return
+            case .denied:
+                throw AudioCaptureError.microphonePermissionDenied
+            case .undetermined:
+                return
+            @unknown default:
+                return
+            }
+        }
+    }
+
     private func startMicrophone() throws {
+        tearDownMicrophoneEngine()
+        micEngine = AVAudioEngine()
+        microphoneInputKind = MicrophoneDeviceInfo.currentInputKind()
+        installDefaultInputDeviceListenerIfNeeded()
+
         let input = micEngine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
-        let targetFormat = try Self.makeTargetFormat()
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            throw AudioCaptureError.inputUnavailable
+        }
 
-        guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
+        let targetFormat = try Self.makeTargetFormat()
+        guard let monoInputFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: inputFormat.sampleRate,
+            channels: 1,
+            interleaved: false
+        ) else {
             throw AudioCaptureError.conversionFailed
         }
+        guard let converter = AVAudioConverter(from: monoInputFormat, to: targetFormat) else {
+            throw AudioCaptureError.conversionFailed
+        }
+
         self.micConverter = converter
+        self.micTargetFormat = targetFormat
 
         input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
-            guard let self else { return }
-            guard let mono = self.convertToMono16K(buffer: buffer, converter: converter, targetFormat: targetFormat) else { return }
+        input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+            guard let self,
+                  let converter = self.micConverter,
+                  let targetFormat = self.micTargetFormat else { return }
+
+            guard let mono = self.convertToMono16K(
+                buffer: buffer,
+                converter: converter,
+                inputFormat: inputFormat,
+                targetFormat: targetFormat
+            ) else { return }
+
             self.onChunk?(CapturedAudioChunk(source: .mic, samples: mono))
+        }
+
+        if let micConfigObserver {
+            NotificationCenter.default.removeObserver(micConfigObserver)
+        }
+        micConfigObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: micEngine,
+            queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            guard self.sourceMode == .mic || self.sourceMode == .mixed else { return }
+            try? self.startMicrophone()
         }
 
         micEngine.prepare()
         try micEngine.start()
+        isMicRunning = true
+    }
+
+    private func tearDownMicrophoneEngine() {
+        if isMicRunning {
+            micEngine.inputNode.removeTap(onBus: 0)
+            micEngine.stop()
+            isMicRunning = false
+        }
+        micConverter = nil
+        micTargetFormat = nil
+    }
+
+    private func installDefaultInputDeviceListenerIfNeeded() {
+        guard defaultInputDeviceListener == nil else { return }
+
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self else { return }
+            guard self.sourceMode == .mic || self.sourceMode == .mixed else { return }
+            self.microphoneInputKind = MicrophoneDeviceInfo.currentInputKind()
+            try? self.startMicrophone()
+        }
+        defaultInputDeviceListener = block
+
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            block
+        )
+    }
+
+    private func removeDefaultInputDeviceListener() {
+        guard defaultInputDeviceListener != nil else { return }
+
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        if let defaultInputDeviceListener {
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                DispatchQueue.main,
+                defaultInputDeviceListener
+            )
+        }
+        defaultInputDeviceListener = nil
     }
 
     private func startSystemAudio() {
@@ -112,23 +245,114 @@ final class AudioCaptureCoordinator {
         return target
     }
 
-    private func convertToMono16K(buffer: AVAudioPCMBuffer, converter: AVAudioConverter, targetFormat: AVAudioFormat) -> [Float]? {
-        let ratio = targetFormat.sampleRate / buffer.format.sampleRate
-        let frameCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1
-        guard let output = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: frameCapacity) else { return nil }
+    private func convertToMono16K(
+        buffer: AVAudioPCMBuffer,
+        converter: AVAudioConverter,
+        inputFormat: AVAudioFormat,
+        targetFormat: AVAudioFormat
+    ) -> [Float]? {
+        guard let monoBuffer = downmixToMono(buffer: buffer, format: inputFormat) else { return nil }
 
+        guard monoBuffer.format.sampleRate == targetFormat.sampleRate,
+              monoBuffer.format.channelCount == targetFormat.channelCount else {
+            return resample(buffer: monoBuffer, converter: converter, targetFormat: targetFormat)
+        }
+
+        guard let channelData = monoBuffer.floatChannelData?[0] else { return nil }
+        let count = Int(monoBuffer.frameLength)
+        guard count > 0 else { return nil }
+        return Array(UnsafeBufferPointer(start: channelData, count: count))
+    }
+
+    private func resample(
+        buffer: AVAudioPCMBuffer,
+        converter: AVAudioConverter,
+        targetFormat: AVAudioFormat
+    ) -> [Float]? {
+        var outputSamples: [Float] = []
         var error: NSError?
-        let status = converter.convert(to: output, error: &error) { _, outStatus in
+        var inputProvided = false
+
+        let ratio = targetFormat.sampleRate / buffer.format.sampleRate
+        let frameCapacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * ratio)) + 64
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: frameCapacity) else {
+            return nil
+        }
+
+        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+            if inputProvided {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            inputProvided = true
             outStatus.pointee = .haveData
             return buffer
         }
 
-        guard status != .error, error == nil, let channelData = output.floatChannelData?[0] else {
-            return nil
+        var status = converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
+        while status != .error {
+            if error != nil { return nil }
+            if outputBuffer.frameLength > 0, let channelData = outputBuffer.floatChannelData?[0] {
+                outputSamples.append(
+                    contentsOf: UnsafeBufferPointer(start: channelData, count: Int(outputBuffer.frameLength))
+                )
+            }
+            if status != .haveData { break }
+            outputBuffer.frameLength = 0
+            status = converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
         }
 
-        let count = Int(output.frameLength)
-        return Array(UnsafeBufferPointer(start: channelData, count: count))
+        return outputSamples.isEmpty ? nil : outputSamples
+    }
+
+    private func downmixToMono(buffer: AVAudioPCMBuffer, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        let frameLength = buffer.frameLength
+        guard frameLength > 0 else { return nil }
+
+        let channelCount = Int(format.channelCount)
+        guard channelCount >= 1 else { return nil }
+
+        if channelCount == 1, format.commonFormat == .pcmFormatFloat32 {
+            return buffer
+        }
+
+        guard let monoFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: format.sampleRate,
+            channels: 1,
+            interleaved: false
+        ) else { return nil }
+
+        guard let monoBuffer = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: frameLength) else {
+            return nil
+        }
+        monoBuffer.frameLength = frameLength
+
+        guard let monoData = monoBuffer.floatChannelData?[0] else { return nil }
+
+        if let floatChannels = buffer.floatChannelData {
+            for frame in 0..<Int(frameLength) {
+                var sum: Float = 0
+                for channel in 0..<channelCount {
+                    sum += floatChannels[channel][frame]
+                }
+                monoData[frame] = sum / Float(channelCount)
+            }
+            return monoBuffer
+        }
+
+        if let int16Channels = buffer.int16ChannelData {
+            for frame in 0..<Int(frameLength) {
+                var sum: Float = 0
+                for channel in 0..<channelCount {
+                    sum += Float(int16Channels[channel][frame]) / Float(Int16.max)
+                }
+                monoData[frame] = sum / Float(channelCount)
+            }
+            return monoBuffer
+        }
+
+        return nil
     }
 }
 
@@ -145,9 +369,6 @@ private final class SystemAudioCapture: NSObject {
     }
 
     func start() {
-        // Force-trigger the OS Screen Recording prompt if needed. After a Debug rebuild
-        // the binary's code signature changes and the cached TCC entry can become stale —
-        // CGRequestScreenCaptureAccess re-syncs it. The call is a no-op when already granted.
         if !CGPreflightScreenCaptureAccess() {
             _ = CGRequestScreenCaptureAccess()
         }
@@ -183,7 +404,7 @@ private final class SystemAudioCapture: NSObject {
                     nsError.domain == "com.apple.coremedia.tcc"
                 let detail = "[\(nsError.domain) \(nsError.code)] \(nsError.localizedDescription)"
                 if isDenied {
-                    self.onStatus(.denied("Permission stale. Open System Settings > Privacy & Security > Screen & System Audio Recording, toggle Livescript OFF then ON, fully quit and relaunch the app. \(detail)"))
+                    self.onStatus(.denied("System audio permission is required. Open System Settings > Privacy & Security > Screen & System Audio Recording, toggle Livescript OFF then ON, then relaunch the app. \(detail)"))
                 } else {
                     self.onStatus(.error(detail))
                 }

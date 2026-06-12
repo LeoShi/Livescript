@@ -20,6 +20,35 @@ struct TranscriptSegment: Identifiable, Codable {
     var isFinal: Bool
     var language: TranscriptLanguage
     var speakerLabel: String?
+    var phase: TranscriptSegmentPhase
+    var utteranceID: UUID?
+    var revisedAt: Date?
+
+    init(
+        id: UUID,
+        timestamp: Date,
+        text: String,
+        isFinal: Bool,
+        language: TranscriptLanguage,
+        speakerLabel: String?,
+        phase: TranscriptSegmentPhase? = nil,
+        utteranceID: UUID? = nil,
+        revisedAt: Date? = nil
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.text = text
+        self.isFinal = isFinal
+        self.language = language
+        self.speakerLabel = speakerLabel
+        if let phase {
+            self.phase = phase
+        } else {
+            self.phase = isFinal ? .refined : .draft
+        }
+        self.utteranceID = utteranceID
+        self.revisedAt = revisedAt
+    }
 }
 
 struct TranscriptSession: Codable {
